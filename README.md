@@ -1,3 +1,5 @@
+# 2D-PDM Isaac sim
+
 **Active Target Search for Occluded Objects in Drawers using 2D Distribution Probability Maps (2D-PDM).**
 
 This repository provides an end-to-end framework within **NVIDIA Isaac Sim** for finding hidden objects in cluttered drawer environments. The project covers the entire pipeline from **vectorized synthetic data collection** to **spatial probability estimation** and autonomous searching.
