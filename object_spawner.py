@@ -309,12 +309,13 @@ class ObjectSpawner:
         world,
         stabilization_steps: int = 60,
         final_stabilization_steps: int = 120,
+        target_not_bottom_prob: float = 0.0,
+        target_top_prob: float = 0.5,
     ) -> None:
         """유사도 기반으로 타겟 오브젝트 주변에 순차적으로 오브젝트를 스폰
-        
-        Genesis scene_generator.py의 generate_one_scene 로직을 Isaac Sim용으로 포팅.
+
         각 환경마다 독립적인 랜덤 scene을 생성합니다.
-        
+
         Parameters
         ----------
         target_name : str
@@ -325,34 +326,31 @@ class ObjectSpawner:
             각 오브젝트 투하 후 안정화 스텝 수
         final_stabilization_steps : int
             모든 오브젝트 투하 후 최종 안정화 스텝 수
+        target_not_bottom_prob : float
+            target이 맨 아래(첫 번째 투하)가 아닐 확률 [0, 1]
+        target_top_prob : float
+            맨 아래가 아닌 경우 중 맨 위(마지막 투하)일 확률 [0, 1]
         """
         # 1. 타겟 오브젝트 찾기
         target_idx = self.get_object_index_by_name(target_name)
         target_category = self._objects_class[self._spawned_names[target_idx]].lower()
-        
+
         container_world_pos, _ = self._container_view.get_world_poses()
-        
-        # 2. 각 환경별로 타겟 위치 생성 (랜덤)
+
+        # 2. 각 환경별로 타겟 투하 위치 사전 계산 (랜덤)
         x_min, x_max = self._bounds["x"]
         y_min, y_max = self._bounds["y"]
         z_drop = self._bounds.get("z_drop", self._bounds["z_surface"] + 0.15)
-        
+
         target_positions = torch.zeros(self._num_envs, 3, device=self._device)
         for env_idx in range(self._num_envs):
             target_positions[env_idx] = torch.tensor([
-                random.uniform(x_min * 0.5, x_max * 0.5),  # 중앙 부근
+                random.uniform(x_min * 0.5, x_max * 0.5),
                 random.uniform(y_min * 0.5, y_max * 0.5),
                 z_drop
             ], device=self._device)
-        
-        # 3. 타겟 오브젝트 투하 및 안정화
-        world_positions = container_world_pos + target_positions
-        self._item_views[target_idx].set_world_poses(world_positions)
-        
-        for _ in range(stabilization_steps):
-            world.step(render=True)
-        
-        # 4. 각 오브젝트의 유사도 점수 계산 (스폰 반경 결정용)
+
+        # 3. 각 오브젝트의 유사도 점수 계산 (스폰 반경 결정용)
         obj_scores: dict[int, float] = {}
         for i, obj_name in enumerate(self._spawned_names):
             if i == target_idx:
@@ -360,62 +358,83 @@ class ObjectSpawner:
             obj_category = self._objects_class[obj_name].lower()
             score = SIMILARITY_MAP.get(target_category, {}).get(obj_category, 0.2)
             obj_scores[i] = score
-        
-        # 5. 각 환경별로 완전히 독립적인 랜덤 스폰 순서 생성
-        # 유사도 순서 무시, 완전 랜덤 (단, 스폰 반경은 각 물체의 유사도에 따라 적용)
+
         all_obj_indices = list(obj_scores.keys())
-        
-        env_spawn_orders: list[list[tuple[int, float]]] = []  # [(obj_idx, score), ...]
+
+        # 4. 각 환경별 스폰 순서 결정 (target 삽입 위치 포함)
+        # 순서 항목: (obj_idx, score_or_None)  ← target은 score=None
+        env_spawn_orders: list[list[tuple[int, float | None]]] = []
         for env_idx in range(self._num_envs):
             shuffled = all_obj_indices.copy()
-            random.shuffle(shuffled)  # 완전 랜덤 순서
-            env_order = [(obj_idx, obj_scores[obj_idx]) for obj_idx in shuffled]
-            env_spawn_orders.append(env_order)
-        
-        # 6. 최대 스폰 횟수 (모든 환경에서 가장 긴 리스트 기준)
+            random.shuffle(shuffled)
+            other_order = [(idx, obj_scores[idx]) for idx in shuffled]
+
+            if random.random() < target_not_bottom_prob:
+                if random.random() < target_top_prob:
+                    # 맨 마지막(위)
+                    order = other_order + [(target_idx, None)]
+                else:
+                    # 중간 (1 ~ len 사이 랜덤 위치)
+                    insert_pos = random.randint(1, len(other_order))
+                    order = other_order[:insert_pos] + [(target_idx, None)] + other_order[insert_pos:]
+            else:
+                # 맨 처음(아래)
+                order = [(target_idx, None)] + other_order
+
+            env_spawn_orders.append(order)
+
+        # 5. 순차 투하
         max_spawn_count = max(len(order) for order in env_spawn_orders)
-        
-        # 7. 순차적으로 각 환경에서 물체 투하 (환경마다 다른 순서)
+        target_spawned = [False] * self._num_envs  # env별 target 투하 완료 여부
+
         for spawn_step in range(max_spawn_count):
-            # 각 환경별로 이번 스텝에 떨어뜨릴 물체 결정
             for env_idx in range(self._num_envs):
                 if spawn_step >= len(env_spawn_orders[env_idx]):
                     continue
-                
+
                 obj_idx, score = env_spawn_orders[env_idx][spawn_step]
-                radius = SCORE_TO_RADIUS.get(score, 0.15)
-                
-                # 현재 타겟 위치 기준으로 스폰 위치 계산
-                cur_target_pos, _ = self._item_views[target_idx].get_world_poses()
-                local_target = cur_target_pos[env_idx] - container_world_pos[env_idx]
-                
-                # 원형 분포로 스폰 위치 계산
-                r = radius * math.sqrt(random.random())
-                theta = random.random() * 2 * math.pi
-                
-                spawn_x = torch.clamp(
-                    local_target[0] + r * math.cos(theta),
-                    torch.tensor(x_min, device=self._device),
-                    torch.tensor(x_max, device=self._device)
-                )
-                spawn_y = torch.clamp(
-                    local_target[1] + r * math.sin(theta),
-                    torch.tensor(y_min, device=self._device),
-                    torch.tensor(y_max, device=self._device)
-                )
-                spawn_z = z_drop + random.uniform(-0.05, 0.1)
-                
-                # 해당 환경에서만 물체 이동
-                current_pos, current_orient = self._item_views[obj_idx].get_world_poses()
-                new_pos = container_world_pos[env_idx] + torch.tensor([spawn_x, spawn_y, spawn_z], device=self._device)
-                current_pos[env_idx] = new_pos
-                self._item_views[obj_idx].set_world_poses(current_pos, current_orient)
-            
+
+                if obj_idx == target_idx:
+                    # 타겟 투하
+                    current_pos, current_orient = self._item_views[target_idx].get_world_poses()
+                    current_pos[env_idx] = container_world_pos[env_idx] + target_positions[env_idx]
+                    self._item_views[target_idx].set_world_poses(current_pos, current_orient)
+                    target_spawned[env_idx] = True
+                else:
+                    # 일반 오브젝트: target의 계획된 위치(미투하) 또는 실제 위치(투하 완료) 기준
+                    if target_spawned[env_idx]:
+                        cur_target_pos, _ = self._item_views[target_idx].get_world_poses()
+                        local_target = cur_target_pos[env_idx] - container_world_pos[env_idx]
+                    else:
+                        local_target = target_positions[env_idx]
+
+                    radius = SCORE_TO_RADIUS.get(score, 0.15)
+                    r = radius * math.sqrt(random.random())
+                    theta = random.random() * 2 * math.pi
+
+                    spawn_x = torch.clamp(
+                        local_target[0] + r * math.cos(theta),
+                        torch.tensor(x_min, device=self._device),
+                        torch.tensor(x_max, device=self._device)
+                    )
+                    spawn_y = torch.clamp(
+                        local_target[1] + r * math.sin(theta),
+                        torch.tensor(y_min, device=self._device),
+                        torch.tensor(y_max, device=self._device)
+                    )
+                    spawn_z = z_drop + random.uniform(-0.05, 0.1)
+
+                    current_pos, current_orient = self._item_views[obj_idx].get_world_poses()
+                    current_pos[env_idx] = container_world_pos[env_idx] + torch.tensor(
+                        [spawn_x, spawn_y, spawn_z], device=self._device
+                    )
+                    self._item_views[obj_idx].set_world_poses(current_pos, current_orient)
+
             # 물리 안정화 (모든 환경 동시에)
             for _ in range(stabilization_steps):
                 world.step(render=True)
-        
-        # 8. 최종 안정화
+
+        # 6. 최종 안정화
         for _ in range(final_stabilization_steps):
             world.step(render=True)
 
