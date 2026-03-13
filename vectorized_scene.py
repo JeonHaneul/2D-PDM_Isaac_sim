@@ -61,8 +61,18 @@ from object_spawner import ObjectSpawner
 # ==============================================================================
 NUM_ENVS = args.num_envs
 GRID_SPACING = 3
+
+# --- 카메라 파라미터 ---
 CAMERA_HEIGHT_OFFSET = 3    # 모든 카메라의 z 높이
 CAMERA_XY_OFFSET = 1       # left/right/top/bottom 카메라의 x 또는 y 오프셋
+
+# --- 스폰 안정화 스텝 ---
+STABILIZATION_STEPS       = 60   # 각 오브젝트 투하 후 안정화 스텝 수
+FINAL_STABILIZATION_STEPS = 120  # 모든 오브젝트 투하 후 최종 안정화 스텝 수
+
+# --- 타겟 레이어 확률 ---
+TARGET_NOT_BOTTOM_PROB = 0.15  # target이 맨 아래가 아닐 확률 (0.0 = 항상 아래)
+TARGET_TOP_PROB        = 0.6  # 맨 아래가 아닌 경우 중 맨 위(마지막)일 확률
 
 # 카메라 설정: offset은 (x, y)만, z는 CAMERA_HEIGHT_OFFSET 사용
 CAMERA_CONFIGS = {
@@ -326,11 +336,12 @@ def save_scene_images(scene_idx: int, target_name: str):
     os.makedirs(seg_dir, exist_ok=True)
     
     saved_count = 0
-    
+    all_scene_classes = {}  # 모든 env/카메라에서 보이는 물체 누적
+
     # 렌더링 안정화
     for _ in range(20):
         world.step(render=True)
-    
+
     # XFormPrimView를 통해 텔레포트 (GUI와 동일하게 작동)
     for env_idx in range(NUM_ENVS):
         env_origin = workspace_origins[env_idx].cpu().numpy()
@@ -412,16 +423,18 @@ def save_scene_images(scene_idx: int, target_name: str):
 
                 cv2.imwrite(os.path.join(seg_dir, f"{filename_base}.png"), seg_color)
 
-                # 씬별 매핑 JSON 저장 (env 0, center 카메라 시점에 한 번만)
-                if env_idx == 0 and cam_name == "center":
-                    import json
-                    json_path = os.path.join(seg_dir, f"scene{scene_idx+1:05d}_mapping.json")
-                    with open(json_path, "w") as f:
-                        json.dump(scene_classes, f, indent=2, ensure_ascii=False)
+                # 모든 env/카메라에서 보이는 물체 누적
+                all_scene_classes.update(scene_classes)
 
             saved_count += 1
-    
-    print(f"  → {saved_count}개 이미지 세트 저장 (rgb/depth/seg)")
+
+    # 씬별 매핑 JSON 저장 (모든 env/카메라 누적 후 1회)
+    import json
+    json_path = os.path.join(seg_dir, f"scene{scene_idx+1:05d}_mapping.json")
+    with open(json_path, "w") as f:
+        json.dump(all_scene_classes, f, indent=2, ensure_ascii=False)
+
+    print(f"  → {saved_count}개 이미지 세트 저장 (rgb/depth/seg), 매핑 {len(all_scene_classes)}개 오브젝트")
     return output_base
 
 
@@ -453,8 +466,10 @@ try:
             object_spawner.spawn_with_similarity(
                 target_name=args.target,
                 world=world,
-                stabilization_steps=60,
-                final_stabilization_steps=120,
+                stabilization_steps=STABILIZATION_STEPS,
+                final_stabilization_steps=FINAL_STABILIZATION_STEPS,
+                target_not_bottom_prob=TARGET_NOT_BOTTOM_PROB,
+                target_top_prob=TARGET_TOP_PROB,
             )
 
             # 이미지 캡처 및 저장
