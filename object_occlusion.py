@@ -149,6 +149,14 @@ os.makedirs(rgb_dir,   exist_ok=True)
 os.makedirs(depth_dir, exist_ok=True)
 os.makedirs(seg_dir,   exist_ok=True)
 
+empty_scene_base      = os.path.join(output_base, "empty_scene")
+empty_scene_rgb_dir   = os.path.join(empty_scene_base, "rgb")
+empty_scene_depth_dir = os.path.join(empty_scene_base, "depth")
+empty_scene_seg_dir   = os.path.join(empty_scene_base, "seg")
+os.makedirs(empty_scene_rgb_dir,   exist_ok=True)
+os.makedirs(empty_scene_depth_dir, exist_ok=True)
+os.makedirs(empty_scene_seg_dir,   exist_ok=True)
+
 # ==============================================================================
 # 7. World 설정
 # ==============================================================================
@@ -359,7 +367,57 @@ def capture_and_save(frame_idx: int, mapping_saved_flag: list):
 
 
 # ==============================================================================
-# 13. 스캔 루프
+# 13. 빈 서랍 환경 캡처 함수
+# ==============================================================================
+def capture_empty_scene():
+    """target object를 화면 밖으로 이동 후 5개 카메라로 빈 서랍 환경 캡처."""
+    print("\n[빈 서랍 환경 캡처 시작]")
+
+    # target을 카메라 시야 밖으로 이동
+    _target_translate_op.Set(Gf.Vec3d(1000.0, 1000.0, 1000.0))
+    for _ in range(RENDER_STABILIZE_STEPS):
+        world.step(render=True)
+
+    for cam_name, pose_info in camera_poses.items():
+        pos    = pose_info["position"].astype(np.float32)
+        orient = pose_info["orientation"].astype(np.float32)
+
+        pos_tensor    = torch.from_numpy(pos).unsqueeze(0).to("cuda")
+        orient_tensor = torch.from_numpy(orient).unsqueeze(0).to("cuda")
+        cam_view.set_world_poses(pos_tensor, orient_tensor)
+
+        for _ in range(CAMERA_STABILIZE_STEPS):
+            world.step(render=True)
+
+        # RGB
+        rgb = capture_cam.get_rgb()
+        if rgb is not None:
+            cv2.imwrite(
+                os.path.join(empty_scene_rgb_dir, f"{cam_name}.png"),
+                cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            )
+
+        # Depth
+        depth = capture_cam.get_depth()
+        if depth is not None:
+            np.save(os.path.join(empty_scene_depth_dir, f"{cam_name}.npy"), depth)
+
+        # Segmentation
+        seg_data = _seg_annotator.get_data()
+        if seg_data is not None and isinstance(seg_data, dict) and "data" in seg_data:
+            seg_ids = seg_data["data"]
+            if seg_ids.ndim == 3:
+                seg_ids = seg_ids[:, :, 0]
+            seg_color = np.zeros((*seg_ids.shape, 3), dtype=np.uint8)
+            cv2.imwrite(os.path.join(empty_scene_seg_dir, f"{cam_name}.png"), seg_color)
+
+        print(f"  [{cam_name}] 캡처 완료")
+
+    print(f"  → 저장 위치: {empty_scene_base}\n")
+
+
+# ==============================================================================
+# 14. 스캔 루프
 # ==============================================================================
 x_values   = np.arange(X_MIN, X_MAX + XY_STEP * 0.5, XY_STEP)
 y_values   = np.arange(Y_MIN, Y_MAX + XY_STEP * 0.5, XY_STEP)
@@ -378,6 +436,16 @@ print(f"  총 위치  : {total_positions}")
 print(f"  총 이미지: {total_positions} × 5 카메라 = {total_positions * 5}장")
 print(f"  출력 위치: {output_base}")
 print("=====================\n")
+
+# 빈 서랍 환경 캡처 (이미 존재하면 건너뜀)
+_empty_done = all(
+    os.path.exists(os.path.join(empty_scene_depth_dir, f"{c}.npy"))
+    for c in CAMERA_CONFIGS
+)
+if _empty_done:
+    print(f"[빈 서랍 환경] 이미 존재, 건너뜀: {empty_scene_base}")
+else:
+    capture_empty_scene()
 
 mapping_saved_flag = [False]  # 리스트로 뮤터블하게 관리
 
