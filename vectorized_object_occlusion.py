@@ -49,7 +49,7 @@ from omni.isaac.core.prims import XFormPrimView
 import omni.replicator.core as rep
 import omni.usd
 import carb
-from pxr import UsdLux, UsdPhysics, UsdGeom, Usd
+from pxr import UsdLux, UsdPhysics, UsdGeom, Usd, Gf
 from semantics.schema.editor import PrimSemanticData
 
 # ==============================================================================
@@ -65,7 +65,7 @@ XY_STEP      = 0.01             # 이동 간격 (m), 기본 1cm
 YAW_STEP_DEG = 30               # yaw 회전 간격 (도), 기본 30도 → 12스텝/위치
 
 # --- Z 파라미터 ---
-BASE_Z   = 0.01                 # 기준 z 높이 (m)
+BASE_Z   = 0.01                 # 기준 z 높이 (m) (book_1 : 0.01, book_2 : 0.01)
 Z_OFFSET = 0.03                 # z층 간격 (m)
 Z_LEVELS = 3                    # z층 횟수 (= 병렬 환경 개수)
 
@@ -278,8 +278,11 @@ for cam_name in CAMERA_CONFIGS:
 
 # ==============================================================================
 # 12. target_object 직접 생성 (클로너 미사용 → quatf/quatd 타입 충돌 회피)
-#     XFormPrimView.set_world_poses()로 제어하므로 xform ops 수동 설정 불필요
+#     USD Xform API로 직접 제어 (set_world_poses는 metersPerUnit 불일치 시 scale 오적용)
 # ==============================================================================
+_target_translate_ops: list = []
+_target_orient_ops:    list = []
+
 for z_idx in range(1, Z_LEVELS):
     prim_path = f"/World/target_object_{z_idx}"
     add_reference_to_stage(usd_path=target_usd_path, prim_path=prim_path)
@@ -288,7 +291,43 @@ for z_idx in range(1, Z_LEVELS):
     PrimSemanticData(prim).add_entry("class", target_usd_name)
     print(f"[OK] target prim 로드 성공: {prim_path}")
 
-targets_view = XFormPrimView("/World/target_object_*")
+# 모든 target prim에 USD Xform ops 설정 (z_idx=0은 이미 로드됨)
+# metersPerUnit 불일치 scale을 보존하고, translate는 로컬 좌표로 환산
+_unit_scale = 1.0  # scale factor (ref_mpu / main_mpu), 첫 prim에서 감지
+
+for z_idx in range(Z_LEVELS):
+    prim = stage.GetPrimAtPath(f"/World/target_object_{z_idx}")
+    xf   = UsdGeom.Xformable(prim)
+
+    scale_backups = []
+    for op in xf.GetOrderedXformOps():
+        if op.GetOpType() == UsdGeom.XformOp.TypeScale:
+            parts    = op.GetOpName().split(":")
+            suffix   = parts[2] if len(parts) > 2 else ""
+            type_str = str(op.GetAttr().GetTypeName())
+            prec     = (UsdGeom.XformOp.PrecisionFloat
+                        if "float" in type_str
+                        else UsdGeom.XformOp.PrecisionDouble)
+            val = op.Get()
+            scale_backups.append((suffix, val, prec))
+            # 첫 prim에서 unit scale 감지 (uniform scale 가정)
+            if z_idx == 0 and val is not None:
+                _unit_scale = float(val[0])
+
+    xf.ClearXformOpOrder()
+    for suffix, val, prec in scale_backups:
+        s_op = xf.AddScaleOp(prec, opSuffix=suffix)
+        if val is not None:
+            s_op.Set(val)
+
+    t_op = xf.AddTranslateOp()
+    o_op = xf.AddOrientOp(UsdGeom.XformOp.PrecisionFloat)
+    # 초기 off-screen 위치: world 1000m → 로컬 좌표 = 1000 / unit_scale
+    t_op.Set(Gf.Vec3d(1000.0 / _unit_scale, 1000.0 / _unit_scale, 1000.0 / _unit_scale))
+    o_op.Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+
+    _target_translate_ops.append(t_op)
+    _target_orient_ops.append(o_op)
 
 # ==============================================================================
 # 13. 카메라 wrapper / render product / seg annotator (모든 환경)
@@ -323,13 +362,7 @@ workspaces_view        = XFormPrimView("/World/workspace_*")
 env_pos_tensor, _      = workspaces_view.get_world_poses()
 env_origins            = env_pos_tensor.cpu().numpy().astype(np.float64)  # (Z_LEVELS, 3)
 
-# 초기 target 위치를 시야 밖으로 설정 (XFormPrimView 사용)
-_off_pos = torch.tensor(
-    [[env_origins[i, 0] + 1000.0, env_origins[i, 1] + 1000.0, 1000.0] for i in range(Z_LEVELS)],
-    dtype=torch.float32, device="cuda",
-)
-_off_ori = torch.tensor([[1.0, 0.0, 0.0, 0.0]] * Z_LEVELS, dtype=torch.float32, device="cuda")
-targets_view.set_world_poses(_off_pos, _off_ori)
+# 초기 target 위치를 시야 밖으로 설정 (USD Xform API 사용, 이미 ops 생성 시 설정됨)
 
 # 카메라 world pose 설정 (실측 env_origins 기반)
 for cam_name, cam_config in CAMERA_CONFIGS.items():
@@ -361,18 +394,17 @@ def set_all_targets(x: float, y: float, yaw_rad: float):
     """모든 환경의 target을 동일한 (x, y, yaw)로, z는 각 환경의 z_level로 배치"""
     rot = R.from_euler("z", yaw_rad)
     q   = rot.as_quat()  # x,y,z,w
-    quat_wxyz = np.array([q[3], q[0], q[1], q[2]], dtype=np.float32)
+    quat_f = Gf.Quatf(float(q[3]), float(q[0]), float(q[1]), float(q[2]))
 
-    positions = np.array(
-        [[env_origins[i, 0] + x, env_origins[i, 1] + y, z_values[i]] for i in range(Z_LEVELS)],
-        dtype=np.float32,
-    )
-    orientations = np.tile(quat_wxyz, (Z_LEVELS, 1))
-
-    targets_view.set_world_poses(
-        torch.tensor(positions,    dtype=torch.float32, device="cuda"),
-        torch.tensor(orientations, dtype=torch.float32, device="cuda"),
-    )
+    for i in range(Z_LEVELS):
+        # world 좌표 → 로컬 좌표: scale(metersPerUnit 보정) 적용된 prim은
+        # translate를 scale로 나눠야 world position이 정확히 반영됨
+        _target_translate_ops[i].Set(Gf.Vec3d(
+            float((env_origins[i, 0] + x) / _unit_scale),
+            float((env_origins[i, 1] + y) / _unit_scale),
+            float(z_values[i]             / _unit_scale),
+        ))
+        _target_orient_ops[i].Set(quat_f)
 
 
 def capture_and_save_env(z_idx: int, frame_idx: int, mapping_saved_flag: list):
