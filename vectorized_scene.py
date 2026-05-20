@@ -413,7 +413,8 @@ def save_scene_images(scene_idx: int, target_name: str):
                         continue
 
                     if class_name not in class_colors:
-                        hue = abs(hash(class_name)) % 180
+                        idx = len(class_colors)
+                        hue = (idx * 23) % 180  # prime stride → 충돌 없는 고유 색상
                         color = cv2.cvtColor(np.uint8([[[hue, 220, 220]]]), cv2.COLOR_HSV2BGR)[0][0]
                         class_colors[class_name] = color.tolist()
 
