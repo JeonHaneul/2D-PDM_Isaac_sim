@@ -65,7 +65,7 @@ XY_STEP      = 0.01             # 이동 간격 (m), 기본 1cm
 YAW_STEP_DEG = 30               # yaw 회전 간격 (도), 기본 30도 → 12스텝/위치
 
 # --- Z 파라미터 ---
-BASE_Z   = 0.01                 # 기준 z 높이 (m) (book_1 : 0.01, book_2 : 0.01)
+BASE_Z   = 0.01                 # 기준 z 높이 (m) (book_1 : 0.01, book_2 : 0.01, book_3 : 0.01, book_4 : 0.01, fruit_1 : 0.01, fruit_2 : 0.01, fruit_3 : 0.01, fruit_4 : 0.05, toy_1 : 0.041, toy_2 : 0.01, toy_3 : 0.01, toy_4 : 0.01, packaged_food_1 : 0.043, packaged_food_2 : 0.04, packaged_food_3 : 0.04, packaged_food_4 : 0.028)
 Z_OFFSET = 0.03                 # z층 간격 (m)
 Z_LEVELS = 3                    # z층 횟수 (= 병렬 환경 개수)
 
@@ -451,7 +451,8 @@ def capture_and_save_env(z_idx: int, frame_idx: int, mapping_saved_flag: list):
 
             class_name = target_usd_name
             if class_name not in class_colors:
-                hue   = abs(hash(class_name)) % 180
+                idx   = len(class_colors)
+                hue   = (idx * 23) % 180  # prime stride → 충돌 없는 고유 색상
                 color = cv2.cvtColor(np.uint8([[[hue, 220, 220]]]), cv2.COLOR_HSV2BGR)[0][0]
                 class_colors[class_name] = color.tolist()
 
